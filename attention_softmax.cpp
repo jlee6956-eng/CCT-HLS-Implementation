@@ -1,4 +1,4 @@
-template<int TOKENS, int DIM>
+template<int TOKENS>
 void attention_softmax_impl(const float *scores,
                             float *scores_softmax)
 {
@@ -23,5 +23,17 @@ void attention_softmax_impl(const float *scores,
             scores_softmax[i * TOKENS + k]
                 = score_softmax_row[k];
         }
+    }
+}
+
+extern "C" {
+    void attention_softmax(const float *scores, float *scores_softmax) {
+        #pragma HLS INTERFACE m_axi port=scores bundle=gmemm0 offset=slave
+        #pragma HLS INTERFACE m_axi port=scores_softmax bundle=gmemm1 offset=slave
+        #pragma HLS INTERFACE s_axilite port=scores bundle=control
+        #pragma HLS INTERFACE s_axilite port=scores_softmax bundle=control
+        #pragma HLS INTERFACE s_axilite port=return bundle=control
+
+        attention_softmax_impl<8>(scores, scores_softmax);
     }
 }
