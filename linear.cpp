@@ -1,22 +1,33 @@
-#include "cct_modules.h" 
+#include "cct_modules.h"
 
-
-template<int TOKENS, int DIM, int OUT_DIM>
-void linear_impl(const float *attention_weights, const float *W, float *next_layer) {
-    gemm_impl<TOKENS,TOKENS,DIM>(attention_weights, W, next_layer);
+template<int TOKENS, int IN_DIM, int OUT_DIM>
+void linear_impl(const float *in,
+                 const float *W,
+                 float *out)
+{
+    gemm_impl<TOKENS, IN_DIM, OUT_DIM>(
+        in,
+        W,
+        out
+    );
 }
 
 extern "C" {
-    void linear(const float *attention_weights, const float *W, float *next_layer) {
-        #pragma HLS INTERFACE m_axi port=attention_weights bundle=gmemm0 offset=slave
-        #pragma HLS INTERFACE m_axi port=W bundle=gmemm1 offset=slave
-        #pragma HLS INTERFACE m_axi port=next_layer bundle=gmemm2 offset=slave
-        #pragma HLS INTEFACE s_axilite port=attention_weights bundle=control
-        #pragma HLS INTEFACE s_axilite port=W bundle=control
-        #pragma HLS INTEFACE s_axilite port=next_layer bundle=control
-        #pragma HLS INTEFACE s_axilite port=return bundle=control
 
-        linear_impl<8, 8, 8>(attention_weights, W, next_layer); 
+void linear(const float *in,
+            const float *W,
+            float *out)
+{
+#pragma HLS INTERFACE m_axi port=in  bundle=gmem0 offset=slave
+#pragma HLS INTERFACE m_axi port=W   bundle=gmem1 offset=slave
+#pragma HLS INTERFACE m_axi port=out bundle=gmem2 offset=slave
 
-    }
+#pragma HLS INTERFACE s_axilite port=in  bundle=control
+#pragma HLS INTERFACE s_axilite port=W   bundle=control
+#pragma HLS INTERFACE s_axilite port=out bundle=control
+#pragma HLS INTERFACE s_axilite port=return bundle=control
+
+    linear_impl<8, 8, 8>(in, W, out);
+}
+
 }

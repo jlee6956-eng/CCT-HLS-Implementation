@@ -19,8 +19,12 @@ float WQ[DIM * DIM];
 float WK[DIM * DIM];
 float WV[DIM * DIM];
 float WO[DIM * DIM_OUT];
-
 float next_layer[TOKENS * DIM_OUT];
+float expected[TOKENS * DIM_OUT] = {
+    11396, 12904, 14412, 15920,
+ 11396, 12904, 14412, 15920,
+ 11396, 12904, 14412, 15920
+};
 
 int main() {
 
@@ -58,6 +62,16 @@ int main() {
 
         std::cout << std::endl;
     }
+
+    for (int k = 0; k < TOKENS; k++) {
+        for (int z = 0; z < DIM_OUT; z++) {
+            if (expected[k*TOKENS + z] != next_layer[k*TOKENS + z]) {
+                std::cout << "FAIL!" << std::endl;
+                return 1;
+            }
+        }
+    }
+    std::cout << "SUCCESS!" << std::endl;
 
     return 0;
 }

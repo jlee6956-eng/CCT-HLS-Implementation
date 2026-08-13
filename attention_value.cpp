@@ -3,7 +3,7 @@
 
 template<int TOKENS, int DIM>
 void attention_value_impl(const float *in, const float *V, float *out) {
-    gemm<TOKENS, TOKENS, DIM>(in, V, out);
+    gemm_impl<TOKENS, TOKENS, DIM>(in, V, out);
 }
 
 extern "C" {
@@ -16,6 +16,6 @@ extern "C" {
         #pragma HLS INTEFACE s_axilite port=V bundle=control
         #pragma HLS INTEFACE s_axilite port=return bundle=control
 
-        attention_value_impl<8, 8, 8>(attention_weights, V, out);
+        attention_value_impl<3, 4, 4>(attention_weights, V, out);
     }
 }
