@@ -128,3 +128,45 @@ void maxpool_impl(
     }
 }
 
+void maxpool_2d_2_impl(const float *in, const float *out) {
+    maxpool_2d_impl<256, 4, 4>(in, out);
+}
+
+void conv_2d_2_impl(const float *input,
+    const float *weights,
+    float *output) {
+        conv_2d_impl<64,256,8,8>(input, weights, output);
+    }
+
+void relu_2_impl(const float *in, float *out) {
+
+    relu_impl<256, 4, 4>(in, out);
+
+}
+
+void flatten_tokens_impl(
+    const float *in,
+    float *out
+)
+{
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+
+            int token = y * W + x;
+
+            for (int c = 0; c < CH; c++) {
+
+                int input_index =
+                    c * H * W
+                    + y * W
+                    + x;
+
+                int output_index =
+                    token * CH
+                    + c;
+
+                out[output_index] = in[input_index];
+            }
+        }
+    }
+}
