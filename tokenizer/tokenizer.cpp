@@ -15,7 +15,7 @@ void tokenizer_impl(
     float pool2_out[256 * 2 * 2];
 
     // Conv 1
-    conv_2d_impl<3, 64, 32, 32>(
+    conv2d_impl<3, 64, 32, 32>(
         input,
         conv1_weights,
         conv1_out
@@ -28,13 +28,13 @@ void tokenizer_impl(
     );
 
     // MaxPool 1
-    maxpool_2d_impl<64, 16, 16>(
+    maxpool_impl<64, 16, 16>(
         conv1_out,
         pool1_out
     );
 
     // Conv 2
-    conv_2d_impl<64, 256, 8, 8>(
+    conv2d_impl<64, 256, 8, 8>(
         pool1_out,
         conv2_weights,
         conv2_out
@@ -47,7 +47,7 @@ void tokenizer_impl(
     );
 
     // MaxPool 2
-    maxpool_2d_impl<256, 4, 4>(
+    maxpool_impl<256, 4, 4>(
         conv2_out,
         pool2_out
     );
@@ -60,16 +60,24 @@ void tokenizer_impl(
 }
 
 extern "C" {
-    void tokenizer(const float *in, const float *conv_1_weights, const float *conv_2_weights, float *out) {
+
+    void tokenizer(
+        const float *in,
+        const float *conv_1_weights,
+        const float *conv_2_weights,
+        float *out
+    )
+    {
         #pragma HLS INTERFACE m_axi port=in bundle=gmem0 offset=slave
-        #pragma HLS INTERFACE m_axi port=out bundle=gmem0 offset=slave
-        #pragma HLS INTERFACE m_axi port=conv_1_weights bundle=gmem0 offset=slave
-        #pragma HLS INTERFACE m_axi port=conv_2_weights bundle=gmem0 offset=slave
-        #pragma HLS INTERFACE s_axilite port=in bundle=slave
-        #pragma HLS INTERFACE s_axilite port=conv_1_weights bundle=slave
-        #pragma HLS INTERFACE s_axilite port=conv_2_weights bundle=slave
-        #pragma HLS INTERFACE s_axilite port=out bundle=slave
-        #pragma HLS INTERFACE s_axilite port=return bundle=slave
+        #pragma HLS INTERFACE m_axi port=conv_1_weights bundle=gmem1 offset=slave
+        #pragma HLS INTERFACE m_axi port=conv_2_weights bundle=gmem2 offset=slave
+        #pragma HLS INTERFACE m_axi port=out bundle=gmem3 offset=slave
+
+        #pragma HLS INTERFACE s_axilite port=in bundle=control
+        #pragma HLS INTERFACE s_axilite port=conv_1_weights bundle=control
+        #pragma HLS INTERFACE s_axilite port=conv_2_weights bundle=control
+        #pragma HLS INTERFACE s_axilite port=out bundle=control
+        #pragma HLS INTERFACE s_axilite port=return bundle=control
 
         tokenizer_impl<4>(
             in,
@@ -77,7 +85,6 @@ extern "C" {
             conv_2_weights,
             out
         );
-
     }
 
 }

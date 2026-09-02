@@ -1,5 +1,5 @@
 #pragma once
-#include <cmath>
+#include <hls_math.h>
 
 
 template<int ROWS, int COLS>
@@ -35,7 +35,7 @@ void softmax_impl(const float *in, float *out) {
     float sum = 0.0f;
 
     for (int i = 0; i < N; i++) {
-        exp_vals[i] = std::exp(in[i] - max_val);
+        exp_vals[i] = hls::expf(in[i] - max_val);
         sum += exp_vals[i];
     }
 
@@ -68,7 +68,7 @@ void layer_norm_impl(const float *in, float *out) {
 
     variance /= (float)N;
 
-    float denom = std::sqrt(variance + EPS);
+    float denom = hls::sqrtf(variance + EPS);
 
     for (int i = 0; i < N; i++) {
         out[i] = (in[i] - mean) / denom;
@@ -122,7 +122,7 @@ void attention_scores_impl(
         score
     );
 
-    float scale = std::sqrt((float)DIM);
+    const float scale = hls::sqrtf((float)DIM);
 
     for (int i = 0; i < TOKENS * TOKENS; i++) {
         score[i] = score[i] / scale;
@@ -193,8 +193,8 @@ void gelu_impl(const float *X, float *out)
             int index = i * DIM + j;
 
             out[index] = 0.5f * X[index] *
-                         (1.0f + std::erf(
-                             X[index] / std::sqrt(2.0f)
+                         (1.0f + hls::erf(
+                             X[index] / hls::sqrtf(2.0f)
                          ));
         }
     }
@@ -267,33 +267,6 @@ void attention_impl(
         V_proj
     );
 
-    std::cout << "\nQ_proj:\n";
-    for (int i = 0; i < TOKENS; i++) {
-        for (int j = 0; j < DIM; j++) {
-            std::cout << Q_proj[i * DIM + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-
-
-    std::cout << "\nK_proj:\n";
-    for (int i = 0; i < TOKENS; i++) {
-        for (int j = 0; j < DIM; j++) {
-            std::cout << K_proj[i * DIM + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-
-
-    std::cout << "\nV_proj:\n";
-    for (int i = 0; i < TOKENS; i++) {
-        for (int j = 0; j < DIM; j++) {
-            std::cout << V_proj[i * DIM + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-
-
     // ========================================================
     // 2. ATTENTION SCORES
     // Includes QK^T / sqrt(DIM)
@@ -305,15 +278,6 @@ void attention_impl(
         scores
     );
 
-    std::cout << "\nScaled attention scores:\n";
-    for (int i = 0; i < TOKENS; i++) {
-        for (int j = 0; j < TOKENS; j++) {
-            std::cout << scores[i * TOKENS + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-
-
     // ========================================================
     // 3. SOFTMAX
     // ========================================================
@@ -322,15 +286,6 @@ void attention_impl(
         scores,
         scores_softmax
     );
-
-    std::cout << "\nAttention weights (softmax):\n";
-    for (int i = 0; i < TOKENS; i++) {
-        for (int j = 0; j < TOKENS; j++) {
-            std::cout << scores_softmax[i * TOKENS + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-
 
     // ========================================================
     // 4. ATTENTION WEIGHTS * V
@@ -342,15 +297,6 @@ void attention_impl(
         scores_valued
     );
 
-    std::cout << "\nAttention x V:\n";
-    for (int i = 0; i < TOKENS; i++) {
-        for (int j = 0; j < DIM; j++) {
-            std::cout << scores_valued[i * DIM + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-
-
     // ========================================================
     // 5. OUTPUT PROJECTION
     // ========================================================
@@ -361,13 +307,6 @@ void attention_impl(
         next_layer
     );
 
-    std::cout << "\nFinal output:\n";
-    for (int i = 0; i < TOKENS; i++) {
-        for (int j = 0; j < DIM_OUT; j++) {
-            std::cout << next_layer[i * DIM_OUT + j] << " ";
-        }
-        std::cout << std::endl;
-    }
 }
 
 template<int TOKENS, int EMBED_DIM, int NUM_HEADS>
@@ -379,6 +318,9 @@ void multi_head_impl(
     const float *WO,
     float *next_layer)
 {
+    static_assert(NUM_HEADS > 0, "NUM_HEADS must be positive");
+    static_assert(EMBED_DIM % NUM_HEADS == 0,
+                  "EMBED_DIM must be divisible by NUM_HEADS");
 
     const int HEAD_DIM = EMBED_DIM / NUM_HEADS;
 
@@ -460,4 +402,108 @@ void multi_head_impl(
         WO,
         next_layer
     );
+}
+
+// LoRA projection: XW + (alpha / RANK)(XA)B.
+template<int TOKENS, int DIM, int RANK>
+void lora_project_impl(
+    const float *X,
+    const float *W,
+    const float *A,
+    const float *B,
+    float alpha,
+    float *out)
+{
+    static_assert(RANK > 0, "RANK must be positive");
+
+    float base[TOKENS * DIM];
+    float XA[TOKENS * RANK];
+    float update[TOKENS * DIM];
+
+    gemm_impl<TOKENS, DIM, DIM>(X, W, base);
+    gemm_impl<TOKENS, DIM, RANK>(X, A, XA);
+    gemm_impl<TOKENS, RANK, DIM>(XA, B, update);
+
+    const float scale = alpha / (float)RANK;
+
+    for (int i = 0; i < TOKENS * DIM; i++) {
+#pragma HLS PIPELINE II=1
+        out[i] = base[i] + scale * update[i];
+    }
+}
+
+// Multi-head attention with LoRA applied to Q and V.
+template<int TOKENS, int EMBED_DIM, int NUM_HEADS, int LORA_RANK>
+void multi_head_lora_impl(
+    const float *X,
+    const float *WQ,
+    const float *WK,
+    const float *WV,
+    const float *WO,
+    const float *lora_AQ,
+    const float *lora_BQ,
+    const float *lora_AV,
+    const float *lora_BV,
+    float lora_alpha,
+    float *next_layer)
+{
+    static_assert(NUM_HEADS > 0, "NUM_HEADS must be positive");
+    static_assert(LORA_RANK > 0, "LORA_RANK must be positive");
+    static_assert(EMBED_DIM % NUM_HEADS == 0,
+                  "EMBED_DIM must be divisible by NUM_HEADS");
+
+    const int HEAD_DIM = EMBED_DIM / NUM_HEADS;
+
+    float Q[TOKENS * EMBED_DIM];
+    float K[TOKENS * EMBED_DIM];
+    float V[TOKENS * EMBED_DIM];
+    float concatenated[TOKENS * EMBED_DIM];
+
+    float Q_h[TOKENS * HEAD_DIM];
+    float K_h[TOKENS * HEAD_DIM];
+    float V_h[TOKENS * HEAD_DIM];
+    float scores[TOKENS * TOKENS];
+    float scores_softmax[TOKENS * TOKENS];
+    float head_output[TOKENS * HEAD_DIM];
+
+    lora_project_impl<TOKENS, EMBED_DIM, LORA_RANK>(
+        X, WQ, lora_AQ, lora_BQ, lora_alpha, Q);
+
+    gemm_impl<TOKENS, EMBED_DIM, EMBED_DIM>(X, WK, K);
+
+    lora_project_impl<TOKENS, EMBED_DIM, LORA_RANK>(
+        X, WV, lora_AV, lora_BV, lora_alpha, V);
+
+    for (int h = 0; h < NUM_HEADS; h++) {
+        for (int token = 0; token < TOKENS; token++) {
+            for (int d = 0; d < HEAD_DIM; d++) {
+#pragma HLS PIPELINE II=1
+                const int full_index =
+                    token * EMBED_DIM + h * HEAD_DIM + d;
+                const int head_index = token * HEAD_DIM + d;
+
+                Q_h[head_index] = Q[full_index];
+                K_h[head_index] = K[full_index];
+                V_h[head_index] = V[full_index];
+            }
+        }
+
+        attention_scores_impl<TOKENS, HEAD_DIM>(Q_h, K_h, scores);
+        attention_softmax_impl<TOKENS>(scores, scores_softmax);
+        attention_value_impl<TOKENS, HEAD_DIM>(
+            scores_softmax, V_h, head_output);
+
+        for (int token = 0; token < TOKENS; token++) {
+            for (int d = 0; d < HEAD_DIM; d++) {
+#pragma HLS PIPELINE II=1
+                const int head_index = token * HEAD_DIM + d;
+                const int full_index =
+                    token * EMBED_DIM + h * HEAD_DIM + d;
+                concatenated[full_index] = head_output[head_index];
+            }
+        }
+    }
+
+    linear_impl<TOKENS, EMBED_DIM, EMBED_DIM>(
+        concatenated, WO, next_layer);
 }
