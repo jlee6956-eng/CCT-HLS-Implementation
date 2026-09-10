@@ -275,4 +275,24 @@ void flatten_tokens_impl(
 {
     for (int y = 0; y < H; y++) {
 
-        for 
+        for (int x = 0; x < W; x++) {
+
+            int token = y * W + x;
+
+            for (int c = 0; c < CH; c++) {
+
+                int input_index =
+                    c * H * W
+                    + y * W
+                    + x;
+
+                int output_index =
+                    token * CH
+                    + c;
+
+                out[output_index] =
+                    in[input_index];
+            }
+        }
+    }
+}

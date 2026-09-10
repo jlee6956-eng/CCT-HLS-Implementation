@@ -1,32 +1,32 @@
 #include <cmath>
 #include <ap_int.h>
 
+// Normalizes each row (token) independently across its COLS
+// features, matching standard transformer LayerNorm.
 template<int ROWS, int COLS>
 void layer_norm_impl(const float *in, float *out) {
-    const int N = ROWS * COLS;
     const float EPS = 1e-5f;
 
-    float sum = 0.0f;
-    float mean = 0.0f;
-    float variance = 0.0f;
+    for (int r = 0; r < ROWS; r++) {
+        float sum = 0.0f;
+        for (int c = 0; c < COLS; c++) {
+            sum += in[r * COLS + c];
+        }
+        float mean = sum / (float)COLS;
 
-    for (int i = 0; i < N; i++) {
-        sum += in[i];
-    }
+        float variance = 0.0f;
+        for (int c = 0; c < COLS; c++) {
+            float diff = in[r * COLS + c] - mean;
+            variance += diff * diff;
+        }
+        variance /= (float)COLS;
 
-    mean = sum / (float)N;
+        float denom = std::sqrt(variance + EPS);
 
-    for (int i = 0; i < N; i++) {
-        float diff = in[i] - mean;
-        variance += diff * diff;
-    }
-
-    variance /= (float)N;
-
-    float denom = std::sqrt(variance + EPS);
-
-    for (int i = 0; i < N; i++) {
-        out[i] = (in[i] - mean) / denom;
+        for (int c = 0; c < COLS; c++) {
+            int idx = r * COLS + c;
+            out[idx] = (in[idx] - mean) / denom;
+        }
     }
 }
 
