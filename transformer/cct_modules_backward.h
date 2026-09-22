@@ -241,6 +241,285 @@ void mlp_backward_impl(
     gemm_backward_dIn1<TOKENS, ORIG_DIM, INNER_DIM>(d_inner, W1, dX);
 }
 
+// Backward of mlp_impl with full (non-frozen) W1/W2: produces the
+// weight gradients dW1/dW2 in addition to dX. `X` is the cached
+// input to the MLP (layer4), `inner` the cached pre-GELU
+// activation (X @ W1); inner_gelu is recomputed here since GELU is
+// cheap relative to caching another TOKENS*INNER_DIM buffer.
+template<int TOKENS, int ORIG_DIM, int INNER_DIM>
+void mlp_backward_full_impl(
+    const float *X,
+    const float *W1,
+    const float *W2,
+    const float *inner,
+    const float *dOut,
+    float *dX,
+    float *dW1,
+    float *dW2)
+{
+    float inner_gelu[TOKENS * INNER_DIM];
+    gelu_impl<TOKENS, INNER_DIM>(inner, inner_gelu);
+
+    float d_inner_gelu[TOKENS * INNER_DIM];
+    gemm_backward_dIn1<TOKENS, INNER_DIM, ORIG_DIM>(dOut, W2, d_inner_gelu);
+    gemm_backward_dIn2<TOKENS, INNER_DIM, ORIG_DIM>(inner_gelu, dOut, dW2);
+
+    float d_inner[TOKENS * INNER_DIM];
+    gelu_backward_impl<TOKENS, INNER_DIM>(inner, d_inner_gelu, d_inner);
+
+    gemm_backward_dIn1<TOKENS, ORIG_DIM, INNER_DIM>(d_inner, W1, dX);
+    gemm_backward_dIn2<TOKENS, ORIG_DIM, INNER_DIM>(X, d_inner, dW1);
+}
+
+// ============================================================
+// Multi-head attention (no LoRA, all weights trainable):
+// training-mode forward (caches what the backward pass needs)
+// and backward, producing gradients for WQ/WK/WV/WO directly via
+// normal (non-LoRA) backprop.
+// ============================================================
+
+template<int TOKENS, int EMBED_DIM, int NUM_HEADS>
+void multi_head_forward_train_impl(
+    const float *X,
+    const float *WQ,
+    const float *WK,
+    const float *WV,
+    const float *WO,
+    float *out,
+    float *Q_cache,
+    float *K_cache,
+    float *V_cache,
+    float *probs_cache,        // [NUM_HEADS * TOKENS * TOKENS]
+    float *concatenated_cache) // [TOKENS * EMBED_DIM]
+{
+    const int HEAD_DIM = EMBED_DIM / NUM_HEADS;
+
+    qkv_project_impl<TOKENS, EMBED_DIM>(
+        X, WQ, WK, WV, Q_cache, K_cache, V_cache);
+
+    for (int head = 0; head < NUM_HEADS; head++) {
+        float Q_h[TOKENS * HEAD_DIM];
+        float K_h[TOKENS * HEAD_DIM];
+        float V_h[TOKENS * HEAD_DIM];
+        float scores[TOKENS * TOKENS];
+        float head_output[TOKENS * HEAD_DIM];
+
+        for (int token = 0; token < TOKENS; token++) {
+            for (int d = 0; d < HEAD_DIM; d++) {
+#pragma HLS PIPELINE II=1
+                int full = token * EMBED_DIM + head * HEAD_DIM + d;
+                int hidx = token * HEAD_DIM + d;
+                Q_h[hidx] = Q_cache[full];
+                K_h[hidx] = K_cache[full];
+                V_h[hidx] = V_cache[full];
+            }
+        }
+
+        float *probs_h = probs_cache + head * TOKENS * TOKENS;
+
+        attention_scores_impl<TOKENS, HEAD_DIM>(Q_h, K_h, scores);
+        attention_softmax_impl<TOKENS>(scores, probs_h);
+        attention_value_impl<TOKENS, HEAD_DIM>(probs_h, V_h, head_output);
+
+        for (int token = 0; token < TOKENS; token++) {
+            for (int d = 0; d < HEAD_DIM; d++) {
+#pragma HLS PIPELINE II=1
+                int hidx = token * HEAD_DIM + d;
+                int full = token * EMBED_DIM + head * HEAD_DIM + d;
+                concatenated_cache[full] = head_output[hidx];
+            }
+        }
+    }
+
+    linear_impl<TOKENS, EMBED_DIM, EMBED_DIM>(concatenated_cache, WO, out);
+}
+
+template<int TOKENS, int EMBED_DIM, int NUM_HEADS>
+void multi_head_backward_impl(
+    const float *X,     // this module's input (e.g. layer1_cache)
+    const float *WQ,
+    const float *WK,
+    const float *WV,
+    const float *WO,
+    const float *Q_cache,
+    const float *K_cache,
+    const float *V_cache,
+    const float *probs_cache,
+    const float *concatenated_cache,
+    const float *dOut,      // gradient wrt this module's output
+    float *dX,
+    float *dWQ, float *dWK, float *dWV, float *dWO)
+{
+    const int HEAD_DIM = EMBED_DIM / NUM_HEADS;
+
+    // out = concatenated @ WO -> both dIn and dW needed (WO trainable).
+    float dConcatenated[TOKENS * EMBED_DIM];
+    gemm_backward_dIn1<TOKENS, EMBED_DIM, EMBED_DIM>(dOut, WO, dConcatenated);
+    gemm_backward_dIn2<TOKENS, EMBED_DIM, EMBED_DIM>(
+        concatenated_cache, dOut, dWO);
+
+    float dQ[TOKENS * EMBED_DIM];
+    float dK[TOKENS * EMBED_DIM];
+    float dV[TOKENS * EMBED_DIM];
+
+    for (int head = 0; head < NUM_HEADS; head++) {
+        float Q_h[TOKENS * HEAD_DIM];
+        float K_h[TOKENS * HEAD_DIM];
+        float V_h[TOKENS * HEAD_DIM];
+        float dHeadOut[TOKENS * HEAD_DIM];
+
+        for (int token = 0; token < TOKENS; token++) {
+            for (int d = 0; d < HEAD_DIM; d++) {
+#pragma HLS PIPELINE II=1
+                int full = token * EMBED_DIM + head * HEAD_DIM + d;
+                int hidx = token * HEAD_DIM + d;
+                Q_h[hidx] = Q_cache[full];
+                K_h[hidx] = K_cache[full];
+                V_h[hidx] = V_cache[full];
+                dHeadOut[hidx] = dConcatenated[full];
+            }
+        }
+
+        const float *probs_h = probs_cache + head * TOKENS * TOKENS;
+
+        float dProbs_h[TOKENS * TOKENS];
+        float dScores_h[TOKENS * TOKENS];
+        float dQ_h[TOKENS * HEAD_DIM];
+        float dK_h[TOKENS * HEAD_DIM];
+        float dV_h[TOKENS * HEAD_DIM];
+
+        attention_value_backward_impl<TOKENS, HEAD_DIM>(
+            probs_h, V_h, dHeadOut, dProbs_h, dV_h);
+
+        attention_softmax_backward_impl<TOKENS>(probs_h, dProbs_h, dScores_h);
+
+        attention_scores_backward_impl<TOKENS, HEAD_DIM>(
+            Q_h, K_h, dScores_h, dQ_h, dK_h);
+
+        for (int token = 0; token < TOKENS; token++) {
+            for (int d = 0; d < HEAD_DIM; d++) {
+#pragma HLS PIPELINE II=1
+                int full = token * EMBED_DIM + head * HEAD_DIM + d;
+                int hidx = token * HEAD_DIM + d;
+                dQ[full] = dQ_h[hidx];
+                dK[full] = dK_h[hidx];
+                dV[full] = dV_h[hidx];
+            }
+        }
+    }
+
+    // Q/K/V = X @ WQ/WK/WV -> both dIn and dW needed (all trainable).
+    float dX_q[TOKENS * EMBED_DIM];
+    float dX_k[TOKENS * EMBED_DIM];
+    float dX_v[TOKENS * EMBED_DIM];
+
+    gemm_backward_dIn1<TOKENS, EMBED_DIM, EMBED_DIM>(dQ, WQ, dX_q);
+    gemm_backward_dIn2<TOKENS, EMBED_DIM, EMBED_DIM>(X, dQ, dWQ);
+
+    gemm_backward_dIn1<TOKENS, EMBED_DIM, EMBED_DIM>(dK, WK, dX_k);
+    gemm_backward_dIn2<TOKENS, EMBED_DIM, EMBED_DIM>(X, dK, dWK);
+
+    gemm_backward_dIn1<TOKENS, EMBED_DIM, EMBED_DIM>(dV, WV, dX_v);
+    gemm_backward_dIn2<TOKENS, EMBED_DIM, EMBED_DIM>(X, dV, dWV);
+
+    for (int i = 0; i < TOKENS * EMBED_DIM; i++) {
+#pragma HLS PIPELINE II=1
+        dX[i] = dX_q[i] + dX_k[i] + dX_v[i];
+    }
+}
+
+// ============================================================
+// Full transformer block (LN -> MHA -> residual -> LN -> MLP ->
+// residual), all weights trainable: training-mode forward and
+// backward via normal (non-LoRA) backprop.
+// ============================================================
+
+template<int TOKENS, int EMBED_DIM, int MLP_DIM, int NUM_HEADS>
+void transformer_block_forward_train_impl(
+    const float *X,
+    const float *WQ, const float *WK, const float *WV, const float *WO,
+    const float *W1, const float *W2,
+    float *out,
+    float *layer1_cache,   // LN1(X)
+    float *Q_cache, float *K_cache, float *V_cache,
+    float *probs_cache,        // [NUM_HEADS * TOKENS * TOKENS]
+    float *concatenated_cache, // [TOKENS * EMBED_DIM]
+    float *layer3_cache,   // X + attn(LN1(X))
+    float *layer4_cache,   // LN2(layer3)
+    float *inner_cache)    // layer4 @ W1, pre-GELU
+{
+    float layer2[TOKENS * EMBED_DIM];
+    float layer5[TOKENS * EMBED_DIM];
+    float inner_gelu[TOKENS * MLP_DIM];
+
+    layer_norm_impl<TOKENS, EMBED_DIM>(X, layer1_cache);
+
+    multi_head_forward_train_impl<TOKENS, EMBED_DIM, NUM_HEADS>(
+        layer1_cache, WQ, WK, WV, WO, layer2,
+        Q_cache, K_cache, V_cache, probs_cache, concatenated_cache);
+
+    residual_add_impl<TOKENS, EMBED_DIM>(X, layer2, layer3_cache);
+
+    layer_norm_impl<TOKENS, EMBED_DIM>(layer3_cache, layer4_cache);
+
+    linear_impl<TOKENS, EMBED_DIM, MLP_DIM>(layer4_cache, W1, inner_cache);
+    gelu_impl<TOKENS, MLP_DIM>(inner_cache, inner_gelu);
+    linear_impl<TOKENS, MLP_DIM, EMBED_DIM>(inner_gelu, W2, layer5);
+
+    residual_add_impl<TOKENS, EMBED_DIM>(layer3_cache, layer5, out);
+}
+
+template<int TOKENS, int EMBED_DIM, int MLP_DIM, int NUM_HEADS>
+void transformer_block_backward_impl(
+    const float *X,
+    const float *WQ, const float *WK, const float *WV, const float *WO,
+    const float *W1, const float *W2,
+    const float *layer1_cache,
+    const float *Q_cache, const float *K_cache, const float *V_cache,
+    const float *probs_cache,
+    const float *concatenated_cache,
+    const float *layer3_cache,
+    const float *layer4_cache,
+    const float *inner_cache,
+    const float *dOut,     // gradient wrt the block's output
+    float *dX,             // gradient wrt the block's input (for the previous block)
+    float *dWQ, float *dWK, float *dWV, float *dWO,
+    float *dW1, float *dW2)
+{
+    // out = layer3 + layer5  ->  dLayer3 gets a direct dOut contribution,
+    // dLayer5 = dOut.
+    float dLayer4[TOKENS * EMBED_DIM];
+    mlp_backward_full_impl<TOKENS, EMBED_DIM, MLP_DIM>(
+        layer4_cache, W1, W2, inner_cache, dOut, dLayer4, dW1, dW2);
+
+    float dLayer3_from_ln2[TOKENS * EMBED_DIM];
+    layer_norm_backward_impl<TOKENS, EMBED_DIM>(
+        layer3_cache, layer4_cache, dLayer4, dLayer3_from_ln2);
+
+    float dLayer3[TOKENS * EMBED_DIM];
+    for (int i = 0; i < TOKENS * EMBED_DIM; i++) {
+#pragma HLS PIPELINE II=1
+        dLayer3[i] = dOut[i] + dLayer3_from_ln2[i];
+    }
+
+    // layer3 = X + layer2  ->  dX gets a direct dLayer3 contribution,
+    // dLayer2 = dLayer3.
+    float dLayer1[TOKENS * EMBED_DIM];
+    multi_head_backward_impl<TOKENS, EMBED_DIM, NUM_HEADS>(
+        layer1_cache, WQ, WK, WV, WO,
+        Q_cache, K_cache, V_cache, probs_cache, concatenated_cache,
+        dLayer3, dLayer1, dWQ, dWK, dWV, dWO);
+
+    float dX_from_ln1[TOKENS * EMBED_DIM];
+    layer_norm_backward_impl<TOKENS, EMBED_DIM>(
+        X, layer1_cache, dLayer1, dX_from_ln1);
+
+    for (int i = 0; i < TOKENS * EMBED_DIM; i++) {
+#pragma HLS PIPELINE II=1
+        dX[i] = dLayer3[i] + dX_from_ln1[i];
+    }
+}
+
 // ============================================================
 // Multi-head attention with LoRA on Q and V: training-mode
 // forward (caches what the backward pass needs) and backward.
