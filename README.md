@@ -19,25 +19,10 @@ input 3×32×32
 Transformer block
 X ─► LayerNorm ─► Multi-Head Attention (LoRA on Q, V) ─► (+X) ─► LayerNorm ─► MLP ─► (+) ─► out
 
-The synthesized top level uses 4 tokens, embedding dimension 256, MLP dimension 512, 4 heads, and LoRA rank 4. It exposes every weight buffer through its own m_axi bundle, with s_axilite control.
-
-LoRA
-
-The frozen projection $W$ gets a trainable low-rank update:
-
+The synthesized top level uses 4 tokens, embedding dimension 256, MLP dimension 512, 4 heads, and LoRA rank 4. It exposes every weight buffer through its own m_axi bundle, with s_axilite control. The frozen projection $W$ gets a trainable low-rank update:
 In transformer_block_lora_backward, only $A_Q, B_Q, A_V, B_V$ are trainable. The frozen weights ($W_Q, W_K, W_V, W_O, W_1, W_2$) only pass the gradient back toward $X$ and never produce weight gradients, which is where LoRA's memory and compute savings come from. $XA$ is recomputed in the backward pass instead of cached, since $r$ is small.
 
-transformer_block_backward is the full-fine-tuning counterpart. It produces gradients for all six weight matrices, which gives a baseline to compare against.
-
-
-Each Python reference (*_ref.py) builds random weights with a fixed seed. It runs the forward pass and an analytic backward pass in NumPy float32, then prints the expected values that are pasted into the matching C++ testbench.
-
-Testbench	Checks	Result
-transformer_block_lora_backward_tb.cpp	out, dX, dA_Q, dB_Q, dA_V, dB_V	all pass
-transformer_block_backward_tb.cpp	dX, dW_Q, dW_K, dW_V, dW_O, dW_1, dW_2	all pass
-conv_2d_tb.cpp	conv border and interior outputs	pass
-
-Tolerances are relative (5e-3, or 2e-2 on the smallest LoRA gradients). The remaining differences come from summation order and from hls::erf vs. math.erf.
+transformer_block_backward is the full-fine-tuning counterpart. It produces gradients for all six weight matrices, which gives a baseline to compare against. Each Python reference (*_ref.py) builds random weights with a fixed seed. It runs the forward pass and an analytic backward pass in NumPy float32, then prints the expected values that are pasted into the matching C++ testbench. Tolerances are relative (5e-3, or 2e-2 on the smallest LoRA gradients). The remaining differences come from summation order and from hls::erf vs. math.erf.
 
 
 
