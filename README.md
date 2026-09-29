@@ -39,11 +39,7 @@ conv_2d_tb.cpp	conv border and interior outputs	pass
 
 Tolerances are relative (5e-3, or 2e-2 on the smallest LoRA gradients). The remaining differences come from summation order and from hls::erf vs. math.erf.
 
-Running C simulation
 
-In Vitis HLS, set transformer_block_lora as the top function and add the matching _tb.cpp as the testbench.
-
-To run outside Vitis, stub hls_math.h with the <cmath> equivalents (hls::expf, hls::sqrtf, hls::erf) and run:
 
 Next steps
 Fixed-point (ap_fixed) datapath and resource/latency comparison against float32
