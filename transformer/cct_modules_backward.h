@@ -16,25 +16,31 @@
 template<int M, int K, int N>
 void gemm_backward_dIn1(const float *dOut, const float *in2, float *dIn1) {
     for (int i = 0; i < M; i++) {
+        float a[N];
+        for (int z = 0; z < N; z++) a[z] = dOut[i * N + z];
         for (int k = 0; k < K; k++) {
             float sum = 0.0f;
             for (int j = 0; j < N; j++) {
-                sum += dOut[i * N + j] * in2[k * N + j];
+                #pragma HLS PIPELINE II=1
+                sum += a[j] * in2[k * N + j];
             }
             dIn1[i * K + k] = sum;
         }
     }
 }
 
-// dIn2 = in1^T @ dOut   (In1: MxK, In2: KxN, dOut: MxN, dIn2: KxN)
 template<int M, int K, int N>
 void gemm_backward_dIn2(const float *in1, const float *dOut, float *dIn2) {
     for (int k = 0; k < K; k++) {
+        float a[M];                                   // column k of in1
+        #pragma HLS ARRAY_PARTITION variable=a complete
+        for (int i = 0; i < M; i++) a[i] = in1[i * K + k];
+
         for (int j = 0; j < N; j++) {
+            #pragma HLS PIPELINE II=1
             float sum = 0.0f;
-            for (int i = 0; i < M; i++) {
-                sum += in1[i * K + k] * dOut[i * N + j];
-            }
+            for (int i = 0; i < M; i++)               // auto-unrolled: 4 MACs at once
+                sum += a[i] * dOut[i * N + j];
             dIn2[k * N + j] = sum;
         }
     }
@@ -55,12 +61,14 @@ void layer_norm_backward_impl(
     for (int r = 0; r < ROWS; r++) {
         float sum = 0.0f;
         for (int c = 0; c < COLS; c++) {
+            #pragma HLS PIPELINE II=1
             sum += in[r * COLS + c];
         }
         float mean = sum / (float)COLS;
 
         float var = 0.0f;
         for (int c = 0; c < COLS; c++) {
+            #pragma HLS PIPELINE II=1
             float diff = in[r * COLS + c] - mean;
             var += diff * diff;
         }
@@ -70,6 +78,7 @@ void layer_norm_backward_impl(
         float mean_dy = 0.0f;
         float mean_dy_y = 0.0f;
         for (int c = 0; c < COLS; c++) {
+            #pragma HLS PIPELINE II=1
             int idx = r * COLS + c;
             mean_dy += dOut[idx];
             mean_dy_y += dOut[idx] * out[idx];
@@ -91,6 +100,7 @@ template<int N>
 void softmax_backward_impl(const float *out, const float *dOut, float *dIn) {
     float dot = 0.0f;
     for (int i = 0; i < N; i++) {
+        #pragma HLS UNROLL 
         dot += dOut[i] * out[i];
     }
     for (int i = 0; i < N; i++) {
@@ -108,9 +118,13 @@ void attention_softmax_backward_impl(
     float prob_row[TOKENS];
     float dprob_row[TOKENS];
     float dscore_row[TOKENS];
+    #pragma HLS ARRAY_PARTITION variable=prob_row complete
+    #pragma HLS ARRAY_PARTITION variable=dprob_row complete
+    #pragma HLS ARRAY_PARTITION variable=dscore_row complete
 
     for (int i = 0; i < TOKENS; i++) {
         for (int j = 0; j < TOKENS; j++) {
+            #pragma HLS PIPELINE II=1
             prob_row[j] = probs[i * TOKENS + j];
             dprob_row[j] = dProbs[i * TOKENS + j];
         }
@@ -118,6 +132,7 @@ void attention_softmax_backward_impl(
         softmax_backward_impl<TOKENS>(prob_row, dprob_row, dscore_row);
 
         for (int k = 0; k < TOKENS; k++) {
+            #pragma HLS PIPELINE
             dScores[i * TOKENS + k] = dscore_row[k];
         }
     }
