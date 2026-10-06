@@ -21,7 +21,7 @@ void gemm_backward_dIn1(const float *dOut, const float *in2, float *dIn1) {
         for (int k = 0; k < K; k++) {
             float sum = 0.0f;
             for (int j = 0; j < N; j++) {
-                #pragma HLS PIPELINE II=1
+                #pragma HLS PIPELINE
                 sum += a[j] * in2[k * N + j];
             }
             dIn1[i * K + k] = sum;
@@ -61,14 +61,14 @@ void layer_norm_backward_impl(
     for (int r = 0; r < ROWS; r++) {
         float sum = 0.0f;
         for (int c = 0; c < COLS; c++) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS PIPELINE
             sum += in[r * COLS + c];
         }
         float mean = sum / (float)COLS;
 
         float var = 0.0f;
         for (int c = 0; c < COLS; c++) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS PIPELINE
             float diff = in[r * COLS + c] - mean;
             var += diff * diff;
         }
@@ -78,7 +78,7 @@ void layer_norm_backward_impl(
         float mean_dy = 0.0f;
         float mean_dy_y = 0.0f;
         for (int c = 0; c < COLS; c++) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS PIPELINE
             int idx = r * COLS + c;
             mean_dy += dOut[idx];
             mean_dy_y += dOut[idx] * out[idx];
