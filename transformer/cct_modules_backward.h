@@ -13,18 +13,31 @@
 // ============================================================
 
 // dIn1 = dOut @ in2^T   (In1: MxK, In2: KxN, dOut: MxN, dIn1: MxK)
+// dIn1 = dOut @ in2^T   (In1: MxK, In2: KxN, dOut: MxN, dIn1: MxK)
 template<int M, int K, int N>
 void gemm_backward_dIn1(const float *dOut, const float *in2, float *dIn1) {
+    const int P = (N < 8) ? N : 8;              // number of partial sums
+    static_assert(N % P == 0, "P must divide N");
+
     for (int i = 0; i < M; i++) {
-        float a[N];
+        float a[N];                              // row i of dOut
+        #pragma HLS ARRAY_PARTITION variable=a cyclic factor=P
         for (int z = 0; z < N; z++) a[z] = dOut[i * N + z];
+
         for (int k = 0; k < K; k++) {
-            float sum = 0.0f;
-            for (int j = 0; j < N; j++) {
+            float part[P];                       // P partial sums for dIn1[i][k]
+            #pragma HLS ARRAY_PARTITION variable=part complete
+            for (int p = 0; p < P; p++) part[p] = 0.0f;
+
+            for (int j = 0; j < N; j += P) {     // step through the row P at a time
                 #pragma HLS PIPELINE
-                sum += a[j] * in2[k * N + j];
+                for (int p = 0; p < P; p++)      // auto-unrolled: P multiply-adds at once
+                    part[p] += a[j + p] * in2[k * N + j + p];
             }
-            dIn1[i * K + k] = sum;
+
+            float total = 0.0f;                  // combine the partial sums
+            for (int p = 0; p < P; p++) total += part[p];
+            dIn1[i * K + k] = total;
         }
     }
 }
