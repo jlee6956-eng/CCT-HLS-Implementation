@@ -11,7 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
-#include "cct_modules_multiblock.h"
+#include "cct_modules_multi_block.h"
+#include "quantize.h"
 
 #define TOKENS      4
 #define EMBED_DIM   256
@@ -120,6 +121,31 @@ int run_auto(const char *name, float cutoff, const int *expected_n, int batches)
     return errors;
 }
 
+// Test 4 helper: replace each block's matrix with its INT8 version,
+// turned back into float (scale * q). The kernel stays FP32 for now.
+template<int SIZE>
+void fake_quantize(float *w) {
+    static int8_t q[SIZE];
+    for (int b = 0; b < B; b++) {
+        float scale = quantize_int8<SIZE>(w + b * SIZE, q);   // one scale per block's matrix
+        for (int i = 0; i < SIZE; i++)
+            w[b * SIZE + i] = scale * q[i];
+    }
+}
+
+// error relative to the size of the values: 0.01 = 1%
+float rel_diff(const float *a, const float *ref, int n) {
+    float m = 0.0f;
+    for (int i = 0; i < n; i++) m = fmaxf(m, fabsf(ref[i]));
+    return max_diff(a, ref, n) / m;
+}
+
+int check_close(const char *name, const float *a, const float *ref, int n, float tol) {
+    float r = rel_diff(a, ref, n);
+    printf("  %-8s error = %.3f%%  %s\n", name, r * 100.0f, r < tol ? "PASS" : "FAIL");
+    return r < tol ? 0 : 1;
+}
+
 int main() {
     srand(42);
     const float alpha = ALPHA;
@@ -222,6 +248,31 @@ int main() {
     errors += run_auto("cutoff below both",       1.0f, exp_none, T3);
     errors += run_auto("cutoff above both",     1.0e9f, exp_all,  T3);
 
+     static float f_out[TD], f_dX[TD], f_dAQ[B*DR], f_dBQ[B*DR], f_dAV[B*DR], f_dBV[B*DR];
+    cct_lora_train(X, WQ, WK, WV, WO, AQ, BQ, AV, BV, alpha, W1, W2, out,
+                   block_in, l1, Qc, Kc, Vc, probs, l3, l4, inner);
+    backward_fixed_n(0, info);
+    for (int i = 0; i < TD; i++)   { f_out[i] = out[i]; f_dX[i] = dX[i]; }
+    for (int i = 0; i < B*DR; i++) { f_dAQ[i] = dAQ[i]; f_dBQ[i] = dBQ[i];
+                                     f_dAV[i] = dAV[i]; f_dBV[i] = dBV[i]; }
+
+    // 2. swap the frozen weights for their INT8 versions (LoRA A, B stay FP32)
+    fake_quantize<DD>(WQ); fake_quantize<DD>(WK);
+    fake_quantize<DD>(WV); fake_quantize<DD>(WO);
+    fake_quantize<DM>(W1); fake_quantize<DM>(W2);
+
+    // 3. run again and compare to the FP32 results
+    cct_lora_train(X, WQ, WK, WV, WO, AQ, BQ, AV, BV, alpha, W1, W2, out,
+                   block_in, l1, Qc, Kc, Vc, probs, l3, l4, inner);
+    backward_fixed_n(0, info);
+    const float TOL = 0.05f;   // allow 5% error
+    printf("INT8 weights vs FP32:\n");
+    errors += check_close("out", out, f_out, TD,   TOL);
+    errors += check_close("dX",  dX,  f_dX,  TD,   TOL);
+    errors += check_close("dAQ", dAQ, f_dAQ, B*DR, TOL);
+    errors += check_close("dBQ", dBQ, f_dBQ, B*DR, TOL);
+    errors += check_close("dAV", dAV, f_dAV, B*DR, TOL);
+    errors += check_close("dBV", dBV, f_dBV, B*DR, TOL);
     printf(errors == 0 ? "\nTEST PASSED\n" : "\nTEST FAILED\n");
     return errors;   // 0 = pass (Vitis C simulation checks this)
 }
