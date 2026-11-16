@@ -150,16 +150,21 @@ void cct_lora_backward_impl(
 //
 // Each call:
 //   1. Choose n_freeze:
-//        - every REFRESH_EVERY batches (including the first),
-//          n_freeze = 0 so every block's average gets refreshed;
+//        - on refresh batches, n_freeze = 0 so every block's average
+//          gets refreshed (see step 4 for when refreshes happen);
 //        - otherwise, freeze blocks from the input side while
 //          their running average is below `cutoff`.
 //   2. Run the backward pass with that n_freeze.
 //   3. Update the running average of every block that ran.
+//   4. On a refresh batch, set the gap to the next refresh:
+//        - total gradient info barely changed since the last refresh
+//          (training has settled) -> double the gap, up to MAX_GAP;
+//        - it changed a lot (still learning, or the data changed)
+//          -> reset the gap to REFRESH_EVERY.
 // ============================================================
 
 template<int TOKENS, int EMBED_DIM, int MLP_DIM, int NUM_HEADS,
-         int LORA_RANK, int NUM_BLOCKS, int REFRESH_EVERY>
+         int LORA_RANK, int NUM_BLOCKS, int REFRESH_EVERY, int MAX_GAP>
 void cct_lora_backward_auto_impl(
     const float *WQ, const float *WK, const float *WV, const float *WO,
     const float *lora_AQ, const float *lora_BQ,
@@ -177,8 +182,12 @@ void cct_lora_backward_auto_impl(
     float *dAQ, float *dBQ,
     float *dAV, float *dBV,
     float cutoff,          // freeze a block if its average info is below this
+    float change_tol,      // "settled" if total info changed less than this (0.1 = 10%)
     float *avg_info,       // [B] state: running average of each block's info
     int *batch_count,      // [1] state: batches seen so far (start at 0)
+    int *next_refresh,     // [1] state: batch number of the next refresh (start at 0)
+    int *refresh_gap,      // [1] state: current gap between refreshes
+    float *last_total,     // [1] state: total info at the last refresh
     float *info,           // [B] this batch's info (blocks that ran)
     int *n_used)           // [1] the n_freeze chosen for this batch
 {
@@ -188,7 +197,7 @@ void cct_lora_backward_auto_impl(
 
     // ---- 1. choose n_freeze ----
     int n = 0;
-    bool refresh = (count % REFRESH_EVERY == 0);
+    bool refresh = (count == *next_refresh);
     if (!refresh) {
         for (int b = 0; b < NUM_BLOCKS; b++) {
             // stop at the first block that is still learning
@@ -216,6 +225,29 @@ void cct_lora_backward_auto_impl(
             avg_info[b] = info[b];                    // first batch: start the average
         else
             avg_info[b] = DECAY * avg_info[b] + (1.0f - DECAY) * info[b];
+    }
+
+    // ---- 4. on a refresh batch, choose the gap to the next refresh ----
+    if (refresh) {
+        float total = 0.0f;                       // every block ran this batch
+        for (int b = 0; b < NUM_BLOCKS; b++) total += info[b];
+
+        int gap;
+        if (count == 0) {
+            gap = REFRESH_EVERY;                  // first batch: start with the base gap
+        } else {
+            float change = total - *last_total;
+            if (change < 0.0f) change = -change;
+            if (change < change_tol * (*last_total)) {   // settled: double the gap
+                gap = *refresh_gap * 2;
+                if (gap > MAX_GAP) gap = MAX_GAP;
+            } else {                              // changed a lot: check often again
+                gap = REFRESH_EVERY;
+            }
+        }
+        *refresh_gap  = gap;
+        *last_total   = total;
+        *next_refresh = count + gap;
     }
 
     *batch_count = count + 1;

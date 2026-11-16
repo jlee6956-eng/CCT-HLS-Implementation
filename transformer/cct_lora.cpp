@@ -12,6 +12,7 @@
 #define NUM_HEADS   4
 #define LORA_RANK   4
 #define NUM_BLOCKS  2
+#define MAX_GAP     160  // longest allowed gap between refreshes
 #define REFRESH_EVERY 10   // full backward (no freezing) every 10th batch
 
 extern "C" {
@@ -112,8 +113,12 @@ void cct_lora_backward(
     float *dAQ, float *dBQ,                           // [B*D*R], [B*R*D]
     float *dAV, float *dBV,                           // [B*D*R], [B*R*D]
     float cutoff,                                     // freeze if avg info < cutoff
+    float change_tol,                                 // settled if total info changed < this
     float *avg_info,                                  // [B] state, kept between calls
     int *batch_count,                                 // [1] state, start at 0
+    int *next_refresh,                                // [1] state, start at 0
+    int *refresh_gap,                                 // [1] state
+    float *last_total,                                // [1] state
     float *info,                                      // [B] this batch's info
     int *n_used)                                      // [1] n_freeze chosen this batch
 {
@@ -146,6 +151,9 @@ void cct_lora_backward(
 #pragma HLS INTERFACE m_axi port=avg_info       offset=slave bundle=gmem26
 #pragma HLS INTERFACE m_axi port=batch_count    offset=slave bundle=gmem27
 #pragma HLS INTERFACE m_axi port=n_used         offset=slave bundle=gmem28
+#pragma HLS INTERFACE m_axi port=next_refresh   offset=slave bundle=gmem29
+#pragma HLS INTERFACE m_axi port=refresh_gap    offset=slave bundle=gmem30
+#pragma HLS INTERFACE m_axi port=last_total     offset=slave bundle=gmem31
 
 #pragma HLS INTERFACE s_axilite port=WQ             bundle=control
 #pragma HLS INTERFACE s_axilite port=WK             bundle=control
@@ -176,13 +184,17 @@ void cct_lora_backward(
 #pragma HLS INTERFACE s_axilite port=avg_info       bundle=control
 #pragma HLS INTERFACE s_axilite port=batch_count    bundle=control
 #pragma HLS INTERFACE s_axilite port=n_used         bundle=control
+#pragma HLS INTERFACE s_axilite port=next_refresh   bundle=control
+#pragma HLS INTERFACE s_axilite port=refresh_gap    bundle=control
+#pragma HLS INTERFACE s_axilite port=last_total     bundle=control
+#pragma HLS INTERFACE s_axilite port=change_tol     bundle=control
 #pragma HLS INTERFACE s_axilite port=cutoff         bundle=control
 #pragma HLS INTERFACE s_axilite port=lora_alpha     bundle=control
 #pragma HLS INTERFACE s_axilite port=return         bundle=control
 
     cct_lora_backward_auto_impl<
         TOKENS, EMBED_DIM, MLP_DIM, NUM_HEADS, LORA_RANK, NUM_BLOCKS,
-        REFRESH_EVERY>(
+        REFRESH_EVERY, MAX_GAP>(
         WQ, WK, WV, WO,
         lora_AQ, lora_BQ, lora_AV, lora_BV, lora_alpha,
         W1, W2,
@@ -190,7 +202,8 @@ void cct_lora_backward(
         Q_cache, K_cache, V_cache, probs_cache,
         layer3_cache, layer4_cache, inner_cache,
         dOut, dX, dAQ, dBQ, dAV, dBV,
-        cutoff, avg_info, batch_count, info, n_used);
+        cutoff, change_tol, avg_info, batch_count,
+        next_refresh, refresh_gap, last_total, info, n_used);
 }
 
 }

@@ -39,7 +39,9 @@ void cct_lora_backward(
     const float *Q_cache, const float *K_cache, const float *V_cache, const float *probs_cache,
     const float *layer3_cache, const float *layer4_cache, const float *inner_cache,
     const float *dOut, float *dX, float *dAQ, float *dBQ, float *dAV, float *dBV,
-    float cutoff, float *avg_info, int *batch_count, float *info, int *n_used);
+    float cutoff, float change_tol, float *avg_info, int *batch_count,
+    int *next_refresh, int *refresh_gap, float *last_total,
+    float *info, int *n_used);
 }
 
 // the multi-block backward with a fixed n_freeze (tests 1 and 2)
@@ -92,6 +94,7 @@ int check(const char *name, const float *a, const float *b, int n) {
 }
 
 const float ALPHA = 8.0f;
+const float CHANGE_TOL = 0.1f;   // total info within 10% = settled
 
 void backward_fixed_n(int n_freeze, float *info_out) {
     cct_lora_backward_impl<TOKENS, EMBED_DIM, MLP_DIM, NUM_HEADS, LORA_RANK, NUM_BLOCKS>(
@@ -105,19 +108,53 @@ void backward_fixed_n(int n_freeze, float *info_out) {
 int run_auto(const char *name, float cutoff, const int *expected_n, int batches) {
     float avg_info[B];
     float info_b[B];
-    int batch_count = 0, n_used = -1;
+    int batch_count = 0, next_refresh = 0, refresh_gap = 0, n_used = -1;
+    float last_total = 0.0f;
     int errors = 0;
     printf("Auto freezing, %s (cutoff = %g):\n  n chosen per batch:", name, cutoff);
     for (int t = 0; t < batches; t++) {
         cct_lora_backward(WQ, WK, WV, WO, AQ, BQ, AV, BV, ALPHA, W1, W2,
                           block_in, l1, Qc, Kc, Vc, probs, l3, l4, inner,
                           dOut, dX, dAQ, dBQ, dAV, dBV,
-                          cutoff, avg_info, &batch_count, info_b, &n_used);
+                          cutoff, CHANGE_TOL, avg_info, &batch_count,
+                          &next_refresh, &refresh_gap, &last_total, info_b, &n_used);
         printf(" %d", n_used);
         if (n_used != expected_n[t]) errors++;
     }
     printf("\n  avg_info = [%g, %g], batch_count = %d  %s\n",
            avg_info[0], avg_info[1], batch_count, errors == 0 ? "PASS" : "FAIL");
+    return errors;
+}
+
+// Test 5 helper: run many batches with every block frozen (huge cutoff),
+// so n = 0 only on refresh batches, and record which batches refreshed.
+// If drift_at >= 0, dOut is doubled from that batch on (gradients jump,
+// like the data suddenly changing).
+int run_refresh_schedule(const char *name, int drift_at,
+                         const int *expected, int n_expected, int batches) {
+    float avg_info[B], info_b[B];
+    int batch_count = 0, next_refresh = 0, refresh_gap = 0, n_used = -1;
+    float last_total = 0.0f;
+    int found = 0, errors = 0;
+    printf("Refresh schedule, %s:\n  refreshed at:", name);
+    for (int t = 0; t < batches; t++) {
+        if (t == drift_at)
+            for (int i = 0; i < TD; i++) dOut[i] *= 2.0f;
+        cct_lora_backward(WQ, WK, WV, WO, AQ, BQ, AV, BV, ALPHA, W1, W2,
+                          block_in, l1, Qc, Kc, Vc, probs, l3, l4, inner,
+                          dOut, dX, dAQ, dBQ, dAV, dBV,
+                          1.0e9f, CHANGE_TOL, avg_info, &batch_count,
+                          &next_refresh, &refresh_gap, &last_total, info_b, &n_used);
+        if (n_used == 0) {                       // this batch was a refresh
+            printf(" %d", t);
+            if (found >= n_expected || expected[found] != t) errors++;
+            found++;
+        }
+    }
+    if (drift_at >= 0 && drift_at < batches)     // put dOut back for later tests
+        for (int i = 0; i < TD; i++) dOut[i] *= 0.5f;
+    if (found != n_expected) errors++;
+    printf("\n  %s\n", errors == 0 ? "PASS" : "FAIL");
     return errors;
 }
 
@@ -248,7 +285,19 @@ int main() {
     errors += run_auto("cutoff below both",       1.0f, exp_none, T3);
     errors += run_auto("cutoff above both",     1.0e9f, exp_all,  T3);
 
-     static float f_out[TD], f_dX[TD], f_dAQ[B*DR], f_dBQ[B*DR], f_dAV[B*DR], f_dBV[B*DR];
+    // ---- Test 5: refresh gap driven by the total gradient info ----
+    // 5a. same data every batch: total never changes, so the gap keeps
+    //     doubling (10, 20, 40, 80) -> refreshes at 0, 10, 30, 70, 150.
+    int exp_stable[5] = {0, 10, 30, 70, 150};
+    errors += run_refresh_schedule("stable data", -1, exp_stable, 5, 160);
+    // 5b. gradients jump at batch 50: the refresh at 70 sees a big change,
+    //     so the gap resets to 10 and starts doubling again.
+    int exp_drift[7] = {0, 10, 30, 70, 80, 100, 140};
+    errors += run_refresh_schedule("data changes at batch 50", 50, exp_drift, 7, 160);
+
+    // ---- Test 4: INT8 weights (fake quantization) ----
+    // 1. FP32 results with the original weights
+    static float f_out[TD], f_dX[TD], f_dAQ[B*DR], f_dBQ[B*DR], f_dAV[B*DR], f_dBV[B*DR];
     cct_lora_train(X, WQ, WK, WV, WO, AQ, BQ, AV, BV, alpha, W1, W2, out,
                    block_in, l1, Qc, Kc, Vc, probs, l3, l4, inner);
     backward_fixed_n(0, info);
